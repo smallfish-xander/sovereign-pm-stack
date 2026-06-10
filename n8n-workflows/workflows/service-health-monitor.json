@@ -1,0 +1,133 @@
+{
+  "name": "Service Health Monitor",
+  "description": null,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      },
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Service Health Monitor — Docker Engine API via Unix socket\n// Checks all containers, restarts unhealthy/exited/dead, logs to DB\nconst http = require('http');\n\nconst MONITORED = [\n  'sovereign-stack-postgres-1',\n  'sovereign-stack-redis-1',\n  'sovereign-stack-minio-1',\n  'sovereign-stack-cloudflared-1',\n  'sovereign-stack-landing-1',\n  'sovereign-stack-searxng-1',\n  'sovereign-stack-qdrant-1',\n  'sovereign-stack-uptime-kuma-1',\n  'sovereign-stack-ollama-1',\n  'sovereign-stack-litellm-1',\n  'sovereign-stack-langfuse-1',\n  'sovereign-stack-authentik-server-1',\n  'sovereign-stack-authentik-worker-1',\n  'sovereign-stack-outline-1',\n];\n\nconst RESTART_COOLDOWN_MS = 5 * 60 * 1000;\n\nfunction dockerRequest(method, path, body) {\n  return new Promise((resolve, reject) => {\n    const options = {\n      socketPath: '/var/run/docker.sock',\n      path: '/v1.41' + path,\n      method: method,\n      headers: { 'Content-Type': 'application/json' }\n    };\n    const req = http.request(options, (res) => {\n      let data = '';\n      res.on('data', (chunk) => { data += chunk; });\n      res.on('end', () => {\n        try {\n          resolve({ status: res.statusCode, data: data ? JSON.parse(data) : null });\n        } catch (e) {\n          resolve({ status: res.statusCode, data: data });\n        }\n      });\n    });\n    req.on('error', reject);\n    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });\n    if (body) req.write(JSON.stringify(body));\n    req.end();\n  });\n}\n\nfunction dockerRequestRaw(method, path) {\n  return new Promise((resolve, reject) => {\n    const options = {\n      socketPath: '/var/run/docker.sock',\n      path: '/v1.41' + path,\n      method: method\n    };\n    const req = http.request(options, (res) => {\n      let data = '';\n      res.on('data', (chunk) => { data += chunk; });\n      res.on('end', () => resolve({ status: res.statusCode, data: data }));\n    });\n    req.on('error', reject);\n    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });\n    req.end();\n  });\n}\n\nfunction dbQuery(sql) {\n  return new Promise(async (resolve, reject) => {\n    try {\n      const createExec = await dockerRequest('POST', '/containers/sovereign-stack-postgres-1/exec', {\n        Cmd: ['sh', '-c', `PGPASSWORD=$POSTGRES_PASSWORD psql -U sovereign -d gilbert -c \"${sql.replace(/\"/g, '\\\\\"')}\"`],\n        AttachStdout: true,\n        AttachStderr: true\n      });\n      if (createExec.status !== 201 || !createExec.data || !createExec.data.Id) {\n        return reject(new Error('Failed to create exec'));\n      }\n      const startExec = await dockerRequestRaw('POST', '/exec/' + createExec.data.Id + '/start');\n      resolve(startExec);\n    } catch (e) {\n      reject(e);\n    }\n  });\n}\n\nfunction sleep(ms) { return new Promise(r => setTimeout(r, ms)); }\n\nfunction friendlyName(containerName) {\n  return containerName.replace('sovereign-stack-', '').replace(/-1$/, '');\n}\n\nasync function checkAndRecover() {\n  const incidents = [];\n\n  for (const name of MONITORED) {\n    try {\n      const inspect = await dockerRequest('GET', '/containers/' + name + '/json');\n      if (inspect.status === 404) continue;\n      if (inspect.status !== 200 || !inspect.data) continue;\n\n      const info = inspect.data;\n      const state = info.State;\n      const containerStatus = state.Status;\n      const healthStatus = state.Health ? state.Health.Status : null;\n      const oomKilled = state.OOMKilled || false;\n      const exitCode = state.ExitCode;\n      const startedAt = new Date(state.StartedAt);\n      const restartCount = info.RestartCount || 0;\n      const containerId = info.Id ? info.Id.substring(0, 12) : '';\n\n      let needsAction = false;\n      let incidentType = '';\n      let severity = 'warning';\n\n      if (containerStatus === 'exited' || containerStatus === 'dead') {\n        needsAction = true;\n        incidentType = containerStatus;\n        severity = 'critical';\n      } else if (healthStatus === 'unhealthy') {\n        needsAction = true;\n        incidentType = 'unhealthy';\n        severity = 'warning';\n      }\n\n      if (oomKilled) {\n        incidentType = 'oom_killed';\n        severity = 'critical';\n      }\n\n      if (!needsAction) continue;\n\n      const msSinceStart = Date.now() - startedAt.getTime();\n      if (msSinceStart < RESTART_COOLDOWN_MS && containerStatus === 'running') {\n        const diag = {\n          container_state: containerStatus,\n          health_status: healthStatus,\n          oom_killed: oomKilled,\n          exit_code: exitCode,\n          restart_count: restartCount,\n          started_at: state.StartedAt,\n          cooldown_remaining_s: Math.round((RESTART_COOLDOWN_MS - msSinceStart) / 1000)\n        };\n        if (state.Health && state.Health.Log && state.Health.Log.length > 0) {\n          diag.health_log = state.Health.Log.slice(-3).map(l => ({\n            exit_code: l.ExitCode,\n            output: (l.Output || '').substring(0, 200),\n            start: l.Start\n          }));\n        }\n        incidents.push({\n          service_name: friendlyName(name),\n          incident_type: 'restart_loop',\n          severity: 'critical',\n          container_id: containerId,\n          diagnostics: diag,\n          action_taken: 'skipped (cooldown)',\n          action_result: 'skipped'\n        });\n        continue;\n      }\n\n      const diag = {\n        container_state: containerStatus,\n        health_status: healthStatus,\n        oom_killed: oomKilled,\n        exit_code: exitCode,\n        restart_count: restartCount,\n        started_at: state.StartedAt\n      };\n\n      if (containerStatus === 'running') {\n        try {\n          const stats = await dockerRequest('GET', '/containers/' + name + '/stats?stream=false');\n          if (stats.status === 200 && stats.data && stats.data.memory_stats) {\n            const memUsage = stats.data.memory_stats.usage || 0;\n            const memLimit = stats.data.memory_stats.limit || 0;\n            diag.mem_usage_mb = Math.round(memUsage / 1024 / 1024);\n            diag.mem_limit_mb = Math.round(memLimit / 1024 / 1024);\n            if (memLimit > 0) diag.mem_pct = Math.round((memUsage / memLimit) * 100);\n          }\n        } catch (e) { /* stats failed */ }\n      }\n\n      if (state.Health && state.Health.Log && state.Health.Log.length > 0) {\n        diag.health_log = state.Health.Log.slice(-3).map(l => ({\n          exit_code: l.ExitCode,\n          output: (l.Output || '').substring(0, 200),\n          start: l.Start\n        }));\n      }\n\n      let actionTaken = 'restart';\n      let actionResult = 'failure';\n\n      try {\n        const restart = await dockerRequest('POST', '/containers/' + name + '/restart?t=30');\n        if (restart.status === 204) {\n          await sleep(30000);\n          const postInspect = await dockerRequest('GET', '/containers/' + name + '/json');\n          if (postInspect.status === 200 && postInspect.data) {\n            const postState = postInspect.data.State;\n            diag.post_restart_state = postState.Status;\n            diag.post_restart_health = postState.Health ? postState.Health.Status : 'no_healthcheck';\n            if (postState.Status === 'running' && (!postState.Health || postState.Health.Status !== 'unhealthy')) {\n              actionResult = 'success';\n            }\n          }\n        }\n      } catch (e) {\n        diag.restart_error = e.message;\n      }\n\n      if (actionResult === 'failure') {\n        actionTaken = 'restart (failed)';\n        incidentType = 'restart_failed';\n        severity = 'critical';\n        try {\n          const logs = await dockerRequestRaw('GET', '/containers/' + name + '/logs?stdout=true&stderr=true&tail=30&timestamps=true');\n          if (logs.status === 200 && logs.data) {\n            const rawLines = logs.data.split('\\n');\n            const cleanLines = rawLines.map(line => line.length > 8 ? line.substring(8) : line).filter(l => l.trim().length > 0);\n            diag.last_logs = cleanLines.slice(-30).join('\\n').substring(0, 2000);\n          }\n        } catch (e) { /* logs failed */ }\n      }\n\n      incidents.push({\n        service_name: friendlyName(name),\n        incident_type: incidentType,\n        severity: severity,\n        container_id: containerId,\n        diagnostics: diag,\n        action_taken: actionTaken,\n        action_result: actionResult\n      });\n\n    } catch (e) {\n      incidents.push({\n        service_name: friendlyName(name),\n        incident_type: 'dead',\n        severity: 'critical',\n        container_id: '',\n        diagnostics: { error: e.message },\n        action_taken: 'inspect failed',\n        action_result: 'failure'\n      });\n    }\n  }\n\n  // Log incidents to DB\n  if (incidents.length > 0) {\n    for (const inc of incidents) {\n      try {\n        const diagJson = JSON.stringify(inc.diagnostics).replace(/'/g, \"''\");\n        const svcName = inc.service_name.replace(/'/g, \"''\");\n        const actTaken = (inc.action_taken || '').replace(/'/g, \"''\");\n        const resolved = inc.action_result === 'success' ? 'true' : 'false';\n        const resolvedAt = inc.action_result === 'success' ? 'now()' : 'NULL';\n        const sql = \"INSERT INTO service_incidents (service_name, incident_type, severity, container_id, diagnostics, action_taken, action_result, resolved, created_at, resolved_at) VALUES ('\" + svcName + \"', '\" + inc.incident_type + \"', '\" + inc.severity + \"', '\" + inc.container_id + \"', '\" + diagJson + \"'::jsonb, '\" + actTaken + \"', '\" + inc.action_result + \"', \" + resolved + \", now(), \" + resolvedAt + \");\";\n        await dbQuery(sql);\n      } catch (e) { /* DB logging failed — non-fatal */ }\n    }\n  }\n\n  // Build email message for downstream emailSend node\n  let message = '';\n  let subject = '';\n  if (incidents.length > 0) {\n    const hasCritical = incidents.some(i => i.severity === 'critical');\n    const allRecovered = incidents.every(i => i.action_result === 'success');\n    subject = 'Health Monitor: ' + incidents.length + ' incident(s)' + (hasCritical ? ' [CRITICAL]' : '') + (allRecovered ? ' [recovered]' : '');\n\n    message = '<html><body>';\n    message += '<h2>Service Health Monitor</h2>';\n    message += '<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\" style=\"border-collapse:collapse;\">';\n    message += '<tr><th>Service</th><th>Issue</th><th>Result</th><th>Details</th></tr>';\n    for (const inc of incidents) {\n      const icon = inc.action_result === 'success' ? '\\u2705' : (inc.severity === 'critical' ? '\\ud83d\\udd34' : '\\u26a0\\ufe0f');\n      let result = '';\n      if (inc.action_result === 'success') {\n        result = 'Restarted OK';\n        if (inc.diagnostics.post_restart_health) result += ' (' + inc.diagnostics.post_restart_health + ')';\n      } else if (inc.action_result === 'skipped') {\n        result = 'Cooldown (' + inc.diagnostics.cooldown_remaining_s + 's remaining)';\n      } else {\n        result = 'RESTART FAILED';\n      }\n      let details = '';\n      if (inc.diagnostics.mem_pct) {\n        details += 'Memory: ' + inc.diagnostics.mem_usage_mb + 'MB/' + inc.diagnostics.mem_limit_mb + 'MB (' + inc.diagnostics.mem_pct + '%)<br>';\n      }\n      if (inc.diagnostics.oom_killed) details += 'OOM Killed<br>';\n      if (inc.diagnostics.exit_code && inc.diagnostics.exit_code !== 0) details += 'Exit code: ' + inc.diagnostics.exit_code + '<br>';\n      message += '<tr><td>' + icon + ' ' + inc.service_name + '</td><td>' + inc.incident_type + '</td><td>' + result + '</td><td>' + (details || '-') + '</td></tr>';\n    }\n    message += '</table>';\n    message += '<p><em>' + new Date().toISOString().substring(0, 19) + 'Z</em></p>';\n    message += '</body></html>';\n  }\n\n  return [{\n    json: {\n      has_incidents: incidents.length > 0,\n      incident_count: incidents.length,\n      message: message,\n      subject: subject,\n      incidents: incidents.map(i => i.service_name + ':' + i.incident_type + ':' + i.action_result)\n    }\n  }];\n}\n\nreturn await checkAndRecover();"
+      },
+      "name": "Health Check & Recovery",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        420,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_incidents }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF Has Incidents",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "notifications@example.com",
+        "toEmail": "inbox@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "html": "={{ $json.message }}",
+        "options": {}
+      },
+      "name": "Send Email Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        860,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "name": "sovereign-stack SMTP"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Health Check & Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Health Check & Recovery": {
+      "main": [
+        [
+          {
+            "node": "IF Has Incidents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Has Incidents": {
+      "main": [
+        [
+          {
+            "node": "Send Email Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "activeVersionId": "8445d3ae-f618-4985-a630-2e3886e5c613",
+  "versionCounter": 173
+}

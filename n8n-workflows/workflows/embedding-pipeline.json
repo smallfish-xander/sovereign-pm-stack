@@ -1,0 +1,234 @@
+{
+  "name": "Embedding Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "name": "Execute Workflow Trigger",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.item.json;\n\n// Validate required fields\nconst source = input.source;\nconst sourceId = input.source_id;\nconst content = input.content;\nconst title = input.title || '';\nconst sessionId = input.session_id || null;\n\nif (!source || !['conversation', 'document'].includes(source)) {\n  return [{ json: { error: 'Invalid source type. Must be \"conversation\" or \"document\".', success: false } }];\n}\n\nif (!sourceId) {\n  return [{ json: { error: 'source_id is required.', success: false } }];\n}\n\nif (!content || content.trim().length === 0) {\n  return [{ json: { error: 'content is required and must not be empty.', success: false } }];\n}\n\n// Chunking parameters\nconst CHUNK_SIZE = 1500;\nconst CHUNK_OVERLAP = 200;\n\n// Split content into overlapping chunks on paragraph boundaries\nconst paragraphs = content.split(/\\n\\n+/);\nconst chunks = [];\nlet currentChunk = '';\nlet chunkIndex = 0;\n\nfor (const para of paragraphs) {\n  if (currentChunk.length + para.length + 2 > CHUNK_SIZE && currentChunk.length > 0) {\n    chunks.push({\n      text: currentChunk.trim(),\n      chunk_index: chunkIndex\n    });\n    chunkIndex++;\n    // Overlap: keep the tail of the current chunk\n    if (currentChunk.length > CHUNK_OVERLAP) {\n      currentChunk = currentChunk.substring(currentChunk.length - CHUNK_OVERLAP) + '\\n\\n' + para;\n    } else {\n      currentChunk = currentChunk + '\\n\\n' + para;\n    }\n  } else {\n    currentChunk = currentChunk ? currentChunk + '\\n\\n' + para : para;\n  }\n}\n\n// Don't forget the last chunk\nif (currentChunk.trim().length > 0) {\n  chunks.push({\n    text: currentChunk.trim(),\n    chunk_index: chunkIndex\n  });\n}\n\n// If content was too small for paragraph splitting, use it as a single chunk\nif (chunks.length === 0) {\n  chunks.push({ text: content.trim(), chunk_index: 0 });\n}\n\n// Generate deterministic UUIDs for each chunk\nfunction deterministicUUID(str) {\n  let h1 = 0xdeadbeef;\n  let h2 = 0x41c6ce57;\n  for (let i = 0; i < str.length; i++) {\n    const ch = str.charCodeAt(i);\n    h1 = Math.imul(h1 ^ ch, 2654435761);\n    h2 = Math.imul(h2 ^ ch, 1597334677);\n  }\n  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);\n  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);\n  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);\n  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);\n  const hex1 = (h1 >>> 0).toString(16).padStart(8, '0');\n  const hex2 = (h2 >>> 0).toString(16).padStart(8, '0');\n  return hex1.substring(0, 8) + '-' + hex1.substring(4, 8) + '-4' + hex2.substring(0, 3) + '-8' + hex2.substring(3, 6) + '-' + hex2.padStart(12, '0').substring(0, 12);\n}\n\nreturn chunks.map(chunk => ({\n  json: {\n    source,\n    source_id: sourceId,\n    title,\n    session_id: sessionId,\n    chunk_text: chunk.text,\n    chunk_index: chunk.chunk_index,\n    total_chunks: chunks.length,\n    point_id: deterministicUUID(sourceId + ':' + chunk.chunk_index),\n    content_preview: chunk.text.substring(0, 200)\n  }\n}));"
+      },
+      "name": "Validate And Chunk",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/embeddings",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'mistral-embed', input: [$json.chunk_text.substring(0, 8000)] }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "name": "Embed Chunk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        680,
+        300
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "name": "LiteLLM Proxy"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const embedResult = $input.item.json;\nconst chunkData = $('Validate And Chunk').item.json;\n\n// Check for error from validation\nif (chunkData.error) {\n  return [{ json: { skip: true, error: chunkData.error, success: false } }];\n}\n\n// Extract embedding\nconst embedding = embedResult.data && embedResult.data[0] && embedResult.data[0].embedding\n  ? embedResult.data[0].embedding\n  : null;\n\nif (!embedding) {\n  return [{ json: { skip: true, error: 'No embedding returned', source_id: chunkData.source_id, chunk_index: chunkData.chunk_index } }];\n}\n\nreturn [{\n  json: {\n    skip: false,\n    qdrant_payload: {\n      points: [{\n        id: chunkData.point_id,\n        vector: embedding,\n        payload: {\n          source: chunkData.source,\n          source_id: chunkData.source_id,\n          session_id: chunkData.session_id,\n          title: chunkData.title,\n          content_preview: chunkData.content_preview,\n          chunk_index: chunkData.chunk_index,\n          total_chunks: chunkData.total_chunks,\n          timestamp: new Date().toISOString()\n        }\n      }]\n    },\n    source: chunkData.source,\n    source_id: chunkData.source_id,\n    chunk_index: chunkData.chunk_index,\n    total_chunks: chunkData.total_chunks,\n    session_id: chunkData.session_id\n  }\n}];"
+      },
+      "name": "Prepare Qdrant Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        920,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "http://qdrant:6333/collections/knowledge/points",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.qdrant_payload) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "name": "Store in Qdrant",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1160,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const allChunks = $('Validate And Chunk').all();\nconst storeResults = $('Store in Qdrant').all();\n\nlet storedCount = 0;\nlet source = '';\nlet sourceId = '';\nlet sessionId = null;\n\nfor (let i = 0; i < storeResults.length; i++) {\n  const result = storeResults[i].json;\n  if (result && result.status === 'ok') {\n    storedCount++;\n  }\n}\n\nif (allChunks.length > 0) {\n  source = allChunks[0].json.source || '';\n  sourceId = allChunks[0].json.source_id || '';\n  sessionId = allChunks[0].json.session_id || null;\n}\n\nreturn [{\n  json: {\n    success: storedCount > 0,\n    source,\n    source_id: sourceId,\n    chunks_stored: storedCount,\n    total_chunks: allChunks.length,\n    session_id: sessionId\n  }\n}];"
+      },
+      "name": "Format Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ \"INSERT INTO audit_log (agent, action, status, detail) VALUES ('gilbert', 'embed', '\" + ($json.success ? 'success' : 'failure') + \"', '\" + JSON.stringify({ source: $json.source, source_id: $json.source_id, chunks_stored: $json.chunks_stored, total_chunks: $json.total_chunks, session_id: $json.session_id }).replace(/'/g, \"''\") + \"'::jsonb);\" }}",
+        "options": {}
+      },
+      "name": "Log Embedding",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1640,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Gilbert Database"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: $('Format Result').first().json }];"
+      },
+      "name": "Return Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1860,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate And Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate And Chunk": {
+      "main": [
+        [
+          {
+            "node": "Embed Chunk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Chunk": {
+      "main": [
+        [
+          {
+            "node": "Prepare Qdrant Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Qdrant Payload": {
+      "main": [
+        [
+          {
+            "node": "Store in Qdrant",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store in Qdrant": {
+      "main": [
+        [
+          {
+            "node": "Format Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Result": {
+      "main": [
+        [
+          {
+            "node": "Log Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Embedding": {
+      "main": [
+        [
+          {
+            "node": "Return Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,217 @@
+{
+  "name": "Budget Monitor",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 60
+            }
+          ]
+        }
+      },
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT bs.*,\n  CASE WHEN bs.circuit_open AND bs.circuit_opened_at < now() - interval '10 minutes' THEN true ELSE false END as should_auto_reset\nFROM budget_state bs WHERE bs.id = 1;",
+        "options": {}
+      },
+      "name": "Read Budget State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        420,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Gilbert Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(*) FILTER (WHERE action = 'llm_call' AND status = 'success') as success_calls,\n  COUNT(*) FILTER (WHERE action = 'llm_call' AND status = 'failure') as failed_calls,\n  COALESCE(SUM(cost_usd), 0) as total_cost\nFROM audit_log WHERE created_at >= CURRENT_DATE;",
+        "options": {}
+      },
+      "name": "Aggregate Daily Stats",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        640,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Gilbert Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const budget = $('Read Budget State').first().json;\nconst stats = $input.item.json;\nconst dailyLimit = parseFloat($env.GILBERT_DAILY_BUDGET_USD || '2.0');\nconst monthlyLimit = parseFloat($env.GILBERT_MONTHLY_BUDGET_USD || '30.0');\n\nconst dailySpend = parseFloat(budget.daily_spend_usd || 0);\nconst monthlySpend = parseFloat(budget.monthly_spend_usd || 0);\nconst shouldAutoReset = budget.should_auto_reset || false;\n\nconst alerts = [];\n\n// Daily budget alerts\nif (dailySpend >= dailyLimit) {\n  alerts.push('\\u26a0\\ufe0f Daily budget EXCEEDED: $' + dailySpend.toFixed(4) + ' / $' + dailyLimit.toFixed(2));\n} else if (dailySpend >= dailyLimit * 0.8) {\n  alerts.push('\\u26a0\\ufe0f Daily budget at 80%: $' + dailySpend.toFixed(4) + ' / $' + dailyLimit.toFixed(2));\n}\n\n// Monthly budget alerts\nif (monthlySpend >= monthlyLimit) {\n  alerts.push('\\u26a0\\ufe0f Monthly budget EXCEEDED: $' + monthlySpend.toFixed(4) + ' / $' + monthlyLimit.toFixed(2));\n} else if (monthlySpend >= monthlyLimit * 0.8) {\n  alerts.push('\\u26a0\\ufe0f Monthly budget at 80%: $' + monthlySpend.toFixed(4) + ' / $' + monthlyLimit.toFixed(2));\n}\n\n// Circuit breaker\nif (budget.circuit_open) {\n  if (shouldAutoReset) {\n    alerts.push('\\u2705 Circuit breaker auto-reset (was open for 10+ min)');\n  } else {\n    alerts.push('\\u274c Circuit breaker OPEN (' + (budget.consecutive_failures || 0) + ' consecutive failures)');\n  }\n}\n\n// Build summary\nconst successCalls = parseInt(stats.success_calls || 0, 10);\nconst failedCalls = parseInt(stats.failed_calls || 0, 10);\nconst totalCost = parseFloat(stats.total_cost || 0);\n\nlet message = '';\nlet subject = '';\nif (alerts.length > 0) {\n  subject = 'Budget Alert: ' + (dailySpend >= dailyLimit ? 'EXCEEDED' : monthlySpend >= monthlyLimit ? 'EXCEEDED' : budget.circuit_open ? 'Circuit Breaker' : '80% Warning');\n  message = '<html><body>';\n  message += '<h2>Gilbert Budget Monitor</h2>';\n  message += '<p>' + alerts.join('<br>') + '</p>';\n  message += '<p><strong>Today:</strong> ' + successCalls + ' calls, ' + failedCalls + ' failures, $' + totalCost.toFixed(4) + ' spent<br>';\n  message += '<strong>Monthly:</strong> ' + (budget.monthly_calls || 0) + ' calls, $' + monthlySpend.toFixed(4) + ' spent</p>';\n  message += '</body></html>';\n}\n\nreturn [{ json: {\n  has_alert: alerts.length > 0,\n  message,\n  subject,\n  should_auto_reset: shouldAutoReset\n}}];"
+      },
+      "name": "Evaluate Alerts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_alert }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "name": "IF Has Alert",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1080,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "notifications@example.com",
+        "toEmail": "inbox@example.com",
+        "subject": "={{ $json.subject }}",
+        "emailType": "html",
+        "html": "={{ $json.message }}",
+        "options": {}
+      },
+      "name": "Send Email Alert",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        300
+      ],
+      "credentials": {
+        "smtp": {
+          "name": "sovereign-stack SMTP"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ (() => { const shouldReset = $('Evaluate Alerts').first().json.should_auto_reset; let sql = \"INSERT INTO audit_log (agent, action, status, detail) VALUES ('monitor', 'budget_alert', 'success', '{\\\"alert\\\": \\\"sent\\\"}'::jsonb);\"; if (shouldReset) { sql += \" UPDATE budget_state SET circuit_open = false, consecutive_failures = 0, circuit_opened_at = NULL, updated_at = now() WHERE id = 1;\"; } return sql; })() }}",
+        "options": {}
+      },
+      "name": "Auto-Reset & Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1520,
+        300
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Gilbert Database"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Budget State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Budget State": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Daily Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Daily Stats": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Alerts": {
+      "main": [
+        [
+          {
+            "node": "IF Has Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Has Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Email Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Email Alert": {
+      "main": [
+        [
+          {
+            "node": "Auto-Reset & Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
